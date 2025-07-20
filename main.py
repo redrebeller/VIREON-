@@ -1,64 +1,94 @@
-from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import yt_dlp
 import os
 import uuid
+import subprocess
+import shutil
 
 app = FastAPI()
 
-# Allow CORS for frontend
+# CORS setup to allow frontend to access backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Change this to your frontend domain in production
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-DOWNLOAD_DIR = "downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# Welcome page at root
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return """
+    <html>
+    <head><title>Vireon Downloader</title></head>
+    <body style="text-align:center; font-family:sans-serif">
+        <h1>✅ Vireon Downloader API is Live</h1>
+        <p>Use the <code>/api/download</code> endpoint to fetch videos.</p>
+    </body>
+    </html>
+    """
 
-class DownloadRequest(BaseModel):
-    url: str
-    format: str = "best"
-
+# POST endpoint to download video or audio
 @app.post("/api/download")
-async def download_video(request: DownloadRequest):
-    uid = str(uuid.uuid4())
-    output_template = os.path.join(DOWNLOAD_DIR, f"{uid}.%(ext)s")
+async def download(request: Request):
+    data = await request.json()
+    url = data.get("url")
+    format_type = data.get("format", "mp4")  # mp4, mp3, best
 
-    ydl_opts = {
-        'format': request.format,
-        'outtmpl': output_template,
-        'quiet': True,
-        'noplaylist': True
-    }
+    if not url:
+        return JSONResponse({"error": "URL not provided"}, status_code=400)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(request.url, download=True)
-        ext = info.get('ext', 'mp4')
-        filename = f"{uid}.{ext}"
+    temp_id = str(uuid.uuid4())
+    out_file = f"{temp_id}.%(ext)s"
+    output_template = os.path.join("downloads", out_file)
 
-    return {
-        "title": info.get("title"),
-        "filename": filename,
-        "thumbnail": info.get("thumbnail"),
-        "duration": info.get("duration"),
-        "url": f"/api/file/{filename}"
-    }
+    # Choose yt-dlp options
+    if format_type == "mp3":
+        ytdlp_args = [
+            "yt-dlp", "-x", "--audio-format", "mp3", "-o", output_template, url
+        ]
+    else:  # mp4 or best
+        ytdlp_args = [
+            "yt-dlp", "-f", "mp4", "-o", output_template, url
+        ]
 
-def delete_file_after_send(path: str):
+    os.makedirs("downloads", exist_ok=True)
+
     try:
-        os.remove(path)
-    except Exception as e:
-        print(f"Error deleting file: {e}")
+        subprocess.run(ytdlp_args, check=True)
+        # Find downloaded file
+        downloaded_file = next(
+            (os.path.join("downloads", f) for f in os.listdir("downloads") if temp_id in f), None
+        )
 
+        if not downloaded_file:
+            return JSONResponse({"error": "Download failed"}, status_code=500)
+
+        return {
+            "filename": os.path.basename(downloaded_file),
+            "download_url": f"/api/file/{os.path.basename(downloaded_file)}"
+        }
+
+    except subprocess.CalledProcessError:
+        return JSONResponse({"error": "yt-dlp failed"}, status_code=500)
+
+
+# Serve the downloaded file and delete after sending
 @app.get("/api/file/{filename}")
-async def serve_file(filename: str, background_tasks: BackgroundTasks):
-    file_path = os.path.join(DOWNLOAD_DIR, filename)
+async def get_file(filename: str):
+    file_path = os.path.join("downloads", filename)
     if not os.path.exists(file_path):
-        return JSONResponse(status_code=404, content={"error": "File not found"})
-    
-    background_tasks.add_task(delete_file_after_send, file_path)
-    return FileResponse(file_path, filename=filename, media_type='application/octet-stream')
+        return JSONResponse({"error": "File not found"}, status_code=404)
+
+    def remove_file(file):
+        try:
+            os.remove(file)
+        except:
+            pass
+
+    response = FileResponse(file_path, filename=filename)
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.call_on_close(lambda: remove_file(file_path))
+    return response
